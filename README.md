@@ -32,7 +32,11 @@ Output info:
     ```
     
 2. Run Command using AWS-RunShellScript document:
-    
+   Select EC2 via Tags
+    `APP:nacos`
+   
+   Command:
+   
     ```bash
     # Get cluster config from Parameter Store, modify the name and region according to your deployment
     config_content=$(aws ssm get-parameter --name nacos-cluster.conf --query Parameter.Value --output text --region cn-north-1)
