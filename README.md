@@ -25,15 +25,16 @@ Output info:
     `name: nacos-cluster`
     value:
     
-    `#ip: port
+    ```#ip: port
     <EC2Instance1PrivateIP>:8848
     <EC2Instance2PrivateIP>:8848
-    <EC2Instance2PrivateIP>:8848`
+    <EC2Instance2PrivateIP>:8848
+    ```
     
 2. Run Command using AWS-RunShellScript document:
     
     ```bash
-    # Get cluster config from Parameter Store
+    # Get cluster config from Parameter Store, modify the name and region according to your deployment
     config_content=$(aws ssm get-parameter --name nacos-cluster.conf --query Parameter.Value --output text --region cn-north-1)
     
     # Create backup of existing config
