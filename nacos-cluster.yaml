@@ -1,0 +1,401 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'AWS CloudFormation template for Nacos cluster deployment with Aurora MySQL and EC2 instances (China Region)'
+
+Parameters:
+  DBUsername:
+    Type: String
+    Description: Username for the RDS database
+    Default: admin
+  DBPassword:
+    Type: String
+    Description: Password for the RDS database
+    NoEcho: true
+    MinLength: 8
+  NacosDB:
+    Type: String
+    Description: NacosDBname
+    Default: nacosdb
+  InstanceType:
+    Type: String
+    Description: EC2 instance type
+    Default: t4g.large
+    AllowedValues:
+      - t4g.large
+      - t4g.xlarge
+      - t4g.2xlarge
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC where the resources will be created
+  PublicSubnets:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Public subnets for the NLB and EC2 instances
+  PrivateSubnets:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Private subnets for the RDS cluster
+
+Resources:
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Subnet group for Aurora MySQL
+      SubnetIds: !Ref PrivateSubnets
+      Tags:
+        - Key: Name
+          Value: nacos-db-subnet-group
+        - Key: APP
+          Value: nacos
+
+  AuroraCluster:
+    Type: AWS::RDS::DBCluster
+    Properties:
+      Engine: aurora-mysql
+      EngineVersion: 8.0.mysql_aurora.3.04.0
+      DatabaseName: !Ref NacosDB
+      MasterUsername: !Ref DBUsername
+      MasterUserPassword: !Ref DBPassword
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VpcSecurityGroupIds: 
+        - !Ref RDSSecurityGroup
+      BackupRetentionPeriod: 7
+      PreferredBackupWindow: 03:00-04:00
+      PreferredMaintenanceWindow: Mon:04:00-Mon:05:00
+      Tags:
+        - Key: Name
+          Value: nacos-aurora-cluster
+        - Key: APP
+          Value: nacos
+
+  AuroraInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBClusterIdentifier: !Ref AuroraCluster
+      DBInstanceClass: db.t4g.large
+      Engine: aurora-mysql
+      PubliclyAccessible: false
+      Tags:
+        - Key: Name
+          Value: nacos-aurora-instance
+        - Key: APP
+          Value: nacos
+
+  RDSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for RDS Aurora
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref EC2SecurityGroup
+      Tags:
+        - Key: Name
+          Value: nacos-rds-sg
+        - Key: APP
+          Value: nacos
+
+  EC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for EC2 instances
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8848
+          ToPort: 8848
+          SourceSecurityGroupId: !Ref NLBSecurityGroup
+      Tags:
+        - Key: Name
+          Value: nacos-ec2-sg
+        - Key: APP
+          Value: nacos
+
+  EC2SGIngressSelf:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref EC2SecurityGroup
+      IpProtocol: -1
+      SourceSecurityGroupId: !Ref EC2SecurityGroup
+      Description: Allow all traffic from self
+
+  NLBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for NLB
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8848
+          ToPort: 8848
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: nacos-nlb-sg
+        - Key: APP
+          Value: nacos
+
+  EC2InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: 
+                - ec2.amazonaws.com.cn
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws-cn:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Tags:
+        - Key: Name
+          Value: nacos-ec2-role
+        - Key: APP
+          Value: nacos
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref EC2InstanceRole
+
+  NacosInstance1:
+    Type: AWS::EC2::Instance
+    DependsOn: AuroraInstance
+    Properties:
+      ImageId: '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-arm64}}'
+      InstanceType: !Ref InstanceType
+      SubnetId: !Select [0, !Ref PublicSubnets]
+      SecurityGroupIds: 
+        - !Ref EC2SecurityGroup
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      UserData: 
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          sudo yum update -y
+          sudo yum install -y java-17-amazon-corretto
+          sudo yum install -y maven unzip
+          sudo dnf install mariadb105 -y
+          cd /opt
+          wget https://s3.cn-north-1.amazonaws.com.cn/www.lijinhong.cn/nacos-server-2.4.3.zip
+          unzip nacos-server-2.4.3.zip
+          chown -R ssm-user:ssm-user /opt/nacos
+
+          # Initialize the database
+          mysql -h ${AuroraCluster.Endpoint.Address} -u ${DBUsername} -p${DBPassword} ${NacosDB} < /opt/nacos/conf/mysql-schema.sql
+
+          # Configure application.properties with MySQL settings
+          sed -i '' \
+          -e 's/^# spring.sql.init.platform=mysql/spring.sql.init.platform=mysql/' \
+          -e 's/^# db.num=1/db.num=1/' \
+          -e 's|^# db.url.0=.*|db.url.0=jdbc:mysql://${AuroraCluster.Endpoint.Address}:3306/${NacosDB}?characterEncoding=utf8\&connectTimeout=1000\&socketTimeout=3000\&autoReconnect=true\&useUnicode=true\&useSSL=false\&serverTimezone=UTC|' \
+          -e 's/^# db.user.0=.*/db.user=${DBUsername}/' \
+          -e 's/^# db.password.0=.*/db.password=${DBPassword}/' \
+          /opt/nacos/conf/application.properties
+
+      Tags:
+        - Key: Name
+          Value: nacos-instance-1
+        - Key: APP
+          Value: nacos
+
+  NacosInstance2:
+    Type: AWS::EC2::Instance
+    DependsOn: AuroraInstance
+    Properties:
+      ImageId: '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-arm64}}'
+      InstanceType: !Ref InstanceType
+      SubnetId: !Select [1, !Ref PublicSubnets]
+      SecurityGroupIds: 
+        - !Ref EC2SecurityGroup
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      UserData: 
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          sudo yum update -y
+          sudo yum install -y java-17-amazon-corretto
+          sudo yum install -y maven unzip
+          sudo dnf install mariadb105 -y
+          cd /opt
+          wget https://s3.cn-north-1.amazonaws.com.cn/www.lijinhong.cn/nacos-server-2.4.3.zip
+          unzip nacos-server-2.4.3.zip
+          chown -R ssm-user:ssm-user /opt/nacos
+
+          # Configure application.properties with MySQL settings
+          sed -i '' \
+          -e 's/^# spring.sql.init.platform=mysql/spring.sql.init.platform=mysql/' \
+          -e 's/^# db.num=1/db.num=1/' \
+          -e 's|^# db.url.0=.*|db.url.0=jdbc:mysql://${AuroraCluster.Endpoint.Address}:3306/${NacosDB}?characterEncoding=utf8\&connectTimeout=1000\&socketTimeout=3000\&autoReconnect=true\&useUnicode=true\&useSSL=false\&serverTimezone=UTC|' \
+          -e 's/^# db.user.0=.*/db.user=${DBUsername}/' \
+          -e 's/^# db.password.0=.*/db.password=${DBPassword}/' \
+          /opt/nacos/conf/application.properties
+
+      Tags:
+        - Key: Name
+          Value: nacos-instance-2
+        - Key: APP
+          Value: nacos
+
+  NacosInstance3:
+    Type: AWS::EC2::Instance
+    DependsOn: AuroraInstance
+    Properties:
+      ImageId: '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-arm64}}'
+      InstanceType: !Ref InstanceType
+      SubnetId: !Select [0, !Ref PublicSubnets]
+      SecurityGroupIds: 
+        - !Ref EC2SecurityGroup
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      UserData: 
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          sudo yum update -y
+          sudo yum install -y java-17-amazon-corretto
+          sudo yum install -y maven unzip
+          sudo dnf install mariadb105 -y
+          cd /opt
+          wget https://s3.cn-north-1.amazonaws.com.cn/www.lijinhong.cn/nacos-server-2.4.3.zip
+          unzip nacos-server-2.4.3.zip
+          chown -R ssm-user:ssm-user /opt/nacos
+
+          # Configure application.properties with MySQL settings
+          sed -i '' \
+          -e 's/^# spring.sql.init.platform=mysql/spring.sql.init.platform=mysql/' \
+          -e 's/^# db.num=1/db.num=1/' \
+          -e 's|^# db.url.0=.*|db.url.0=jdbc:mysql://${AuroraCluster.Endpoint.Address}:3306/${NacosDB}?characterEncoding=utf8\&connectTimeout=1000\&socketTimeout=3000\&autoReconnect=true\&useUnicode=true\&useSSL=false\&serverTimezone=UTC|' \
+          -e 's/^# db.user.0=.*/db.user=${DBUsername}/' \
+          -e 's/^# db.password.0=.*/db.password=${DBPassword}/' \
+          /opt/nacos/conf/application.properties
+
+      Tags:
+        - Key: Name
+          Value: nacos-instance-3
+        - Key: APP
+          Value: nacos
+
+  NacosTargetGroupInternalNLB:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckEnabled: true
+      HealthCheckPort: '8848'
+      Port: 8848
+      Protocol: TCP
+      VpcId: !Ref VpcId
+      TargetType: instance
+      Targets:
+        - Id: !Ref NacosInstance1
+        - Id: !Ref NacosInstance2
+        - Id: !Ref NacosInstance3
+      Tags:
+        - Key: Name
+          Value: nacos-target-group
+        - Key: APP
+          Value: nacos
+
+  NacosTargetGroupPublicNLB:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckEnabled: true
+      HealthCheckPort: '8848'
+      Port: 8848
+      Protocol: TCP
+      VpcId: !Ref VpcId
+      TargetType: instance
+      Targets:
+        - Id: !Ref NacosInstance1
+        - Id: !Ref NacosInstance2
+        - Id: !Ref NacosInstance3
+      Tags:
+        - Key: Name
+          Value: nacos-target-group
+        - Key: APP
+          Value: nacos
+
+  PublicNLB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Type: network
+      Scheme: internet-facing
+      Subnets: !Ref PublicSubnets
+      SecurityGroups:
+        - !Ref NLBSecurityGroup
+      Tags:
+        - Key: Name
+          Value: nacos-public-nlb
+        - Key: APP
+          Value: nacos
+
+  PublicNLBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref NacosTargetGroupPublicNLB
+      LoadBalancerArn: !Ref PublicNLB
+      Port: 8848
+      Protocol: TCP
+
+  InternalNLB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Type: network
+      Scheme: internal
+      Subnets: !Ref PublicSubnets
+      Tags:
+        - Key: Name
+          Value: nacos-internal-nlb
+        - Key: APP
+          Value: nacos
+
+  InternalNLBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref NacosTargetGroupInternalNLB
+      LoadBalancerArn: !Ref InternalNLB
+      SecurityGroups:
+        - !Ref NLBSecurityGroup
+      Port: 8848
+      Protocol: TCP
+
+Outputs:
+  DBEndpoint:
+    Description: Aurora cluster endpoint
+    Value: !GetAtt AuroraCluster.Endpoint.Address
+  DBUsername:
+    Description: Database master username
+    Value: !Ref DBUsername
+  PublicNLBDNS:
+    Description: Public NLB DNS name
+    Value: !GetAtt PublicNLB.DNSName
+  InternalNLBDNS:
+    Description: Internal NLB DNS name
+    Value: !GetAtt InternalNLB.DNSName
+  EC2Instance1Id:
+    Description: EC2 Instance 1 ID
+    Value: !Ref NacosInstance1
+  EC2Instance1PrivateIP:
+    Description: EC2 Instance 1 Private IP
+    Value: !GetAtt NacosInstance1.PrivateIp
+  EC2Instance1PublicIP:
+    Description: EC2 Instance 1 Public IP
+    Value: !GetAtt NacosInstance1.PublicIp
+  EC2Instance2Id:
+    Description: EC2 Instance 2 ID
+    Value: !Ref NacosInstance2
+  EC2Instance2PrivateIP:
+    Description: EC2 Instance 2 Private IP
+    Value: !GetAtt NacosInstance2.PrivateIp
+  EC2Instance2PublicIP:
+    Description: EC2 Instance 2 Public IP
+    Value: !GetAtt NacosInstance2.PublicIp
+  EC2Instance3Id:
+    Description: EC2 Instance 3 ID
+    Value: !Ref NacosInstance3
+  EC2Instance3PrivateIP:
+    Description: EC2 Instance 3 Private IP
+    Value: !GetAtt NacosInstance3.PrivateIp
+  EC2Instance3PublicIP:
+    Description: EC2 Instance 3 Public IP
+    Value: !GetAtt NacosInstance3.PublicIp
