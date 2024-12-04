@@ -17,17 +17,19 @@ Output info:
 ## Config and Start EC2 Nacos Service
 1. create System manager parameter store
    Example:
-   key: nacos-cluster
+   name: nacos-cluster
    value:
-   '''text
+'''text
    #ip: port
    <EC2Instance1PrivateIP>:8848
    <EC2Instance2PrivateIP>:8848
    <EC2Instance2PrivateIP>:8848
 3. Run Command using AWS-RunShellScript document:
-   '''shell
+'''shell
    # Get cluster config from Parameter Store
-  config_content=$(aws ssm get-parameter --name nacos-cluster.conf --query Parameter.Value --output text --region cn-north-1)
+   # Remember to replace the parameter name and region code that match your deployment
+  config_content=$(aws ssm get-parameter --name nacos-cluster.conf --query Parameter.Value --output text --region cn-northwest-1)
+  
   
   # Create backup of existing config
   cd /opt/nacos/conf
@@ -69,7 +71,7 @@ Output info:
   
   # Start the service
   systemctl start nacos
-
+'''
 ## Start Using nacos service
 Access via internet with public ELB DNS Name
 Access via internal with private ELB DNS Name
